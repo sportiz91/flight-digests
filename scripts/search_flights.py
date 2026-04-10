@@ -64,13 +64,26 @@ DESTINATION = "EZE"
 
 DAYS_OUT_MIN = 60
 DAYS_OUT_MAX = 180
-TRIP_LEN_MIN = 14
-TRIP_LEN_MAX = 30
+TRIP_LEN_MIN = 30
+TRIP_LEN_MAX = 60
 COMBOS_PER_ORIGIN = 6
 MAX_STOPS = 2
 SEAT = "economy"
 LANGUAGE = "en"
 CURRENCY = "EUR"
+
+# Stopover routes — manual stays of 1-3 days in a connecting city.
+# Each route is searched as 3 separate one-way queries that get summed
+# (the "buy each leg separately" pattern). Google Flights does not pre-render
+# multi-city results in HTML, so we can't parse a single multi-city query.
+# direction: "out" = stopover on the way to EZE, "back" = stopover on return
+STOPOVER_ROUTES = [
+    {"direction": "out", "origin": "BCN", "via": "LIS", "stop_days": 2},   # TAP stopover
+    {"direction": "out", "origin": "MAD", "via": "GRU", "stop_days": 2},   # LATAM via São Paulo
+    {"direction": "back", "origin": "BCN", "via": "GRU", "stop_days": 2},  # cousin's pattern
+    {"direction": "back", "origin": "MAD", "via": "GRU", "stop_days": 2},  # cousin's pattern (MAD)
+]
+STOPOVER_COMBOS_PER_ROUTE = 2  # date pairs per stopover route
 
 
 def date_combinations(seed: int):
@@ -87,6 +100,120 @@ def date_combinations(seed: int):
         inbound = outbound + timedelta(days=trip_len)
         pairs.append((outbound.isoformat(), inbound.isoformat()))
     return pairs
+
+
+def _one_way_cheapest(origin: str, dest: str, day: str, max_stops: int = 1):
+    """Run a one-way search and return the cheapest option as a dict, or None."""
+    try:
+        q = create_query(
+            flights=[FlightQuery(date=day, from_airport=origin, to_airport=dest)],
+            seat=SEAT,
+            trip="one-way",
+            passengers=Passengers(adults=1),
+            language=LANGUAGE,
+            currency=CURRENCY,
+            max_stops=max_stops,
+        )
+        result = get_flights(q)
+    except Exception as e:
+        print(
+            f"  [skip] {origin}->{dest} {day}: {type(e).__name__}: {str(e)[:100]}",
+            file=sys.stderr,
+        )
+        return None
+
+    if not result:
+        return None
+
+    cheapest = min(result, key=lambda f: f.price or 999999)
+    return {
+        "from": origin,
+        "to": dest,
+        "date": day,
+        "price_eur": cheapest.price,
+        "airlines": cheapest.airlines,
+        "duration_min": sum(f.duration or 0 for f in cheapest.flights),
+        "url": q.url(),
+    }
+
+
+def _multicity_url(legs: list) -> str:
+    """Build a Google Flights multi-city URL for the given legs (for the user to inspect)."""
+    flights = [
+        FlightQuery(date=leg["date"], from_airport=leg["from"], to_airport=leg["to"])
+        for leg in legs
+    ]
+    q = create_query(
+        flights=flights,
+        seat=SEAT,
+        trip="multi-city",
+        passengers=Passengers(adults=1),
+        language=LANGUAGE,
+        currency=CURRENCY,
+        max_stops=1,
+    )
+    return q.url()
+
+
+def search_stopover(route: dict, outbound_day: str, return_day: str) -> dict | None:
+    """Search a stopover route by decomposing it into 3 one-way queries.
+
+    For direction='out': origin -> via -> EZE ... return EZE -> origin
+    For direction='back': origin -> EZE ... return EZE -> via -> origin
+    """
+    origin = route["origin"]
+    via = route["via"]
+    stop_days = route["stop_days"]
+
+    if route["direction"] == "out":
+        leg1_date = outbound_day  # origin -> via
+        leg2_date = (date.fromisoformat(outbound_day) + timedelta(days=stop_days)).isoformat()  # via -> EZE
+        leg3_date = return_day    # EZE -> origin (direct)
+        legs_def = [
+            (origin, via, leg1_date),
+            (via, DESTINATION, leg2_date),
+            (DESTINATION, origin, leg3_date),
+        ]
+    else:  # back
+        leg1_date = outbound_day  # origin -> EZE (direct)
+        leg2_date = (date.fromisoformat(return_day) - timedelta(days=stop_days)).isoformat()  # EZE -> via
+        leg3_date = return_day    # via -> origin
+        legs_def = [
+            (origin, DESTINATION, leg1_date),
+            (DESTINATION, via, leg2_date),
+            (via, origin, leg3_date),
+        ]
+
+    legs = []
+    for frm, to, day in legs_def:
+        leg = _one_way_cheapest(frm, to, day, max_stops=1)
+        if leg is None:
+            print(f"    [skip stopover] missing leg {frm}->{to} {day}", file=sys.stderr)
+            return None
+        legs.append(leg)
+        time.sleep(0.6)  # gentle pacing within a single stopover route
+
+    total_price = sum(leg["price_eur"] or 0 for leg in legs)
+    total_duration = sum(leg["duration_min"] or 0 for leg in legs)
+
+    return {
+        "kind": f"stopover-{route['direction']}",
+        "origin": origin,
+        "destination": DESTINATION,
+        "stopover_city": via,
+        "stop_days": stop_days,
+        "outbound_date": outbound_day,
+        "return_date": return_day,
+        "trip_days": (date.fromisoformat(return_day) - date.fromisoformat(outbound_day)).days,
+        "legs": legs,
+        "total_price_eur": total_price,
+        "total_duration_min": total_duration,
+        # Multi-city URL on Google Flights — Google may show a single-ticket
+        # price that's different (often lower) than our decomposed sum.
+        "search_url": _multicity_url([
+            {"from": frm, "to": to, "date": day} for frm, to, day in legs_def
+        ]),
+    }
 
 
 def search_one(origin: str, outbound: str, inbound: str) -> dict | None:
@@ -159,6 +286,7 @@ def main():
         file=sys.stderr,
     )
 
+    # ── Direct round-trip searches ────────────────────────────────────────
     results = []
     for origin in ORIGINS:
         pairs = date_combinations(seed=args.seed + (hash(origin) % 1000))
@@ -176,6 +304,30 @@ def main():
                 )
             time.sleep(1.2)  # gentle pacing
 
+    # ── Stopover searches (multi-city decomposed into one-way legs) ───────
+    print(f"\n=== Stopover routes ({len(STOPOVER_ROUTES)} routes) ===", file=sys.stderr)
+    stopover_results = []
+    for route in STOPOVER_ROUTES:
+        route_label = (
+            f"{route['origin']}→{route['via']}→EZE"
+            if route["direction"] == "out"
+            else f"EZE→{route['via']}→{route['origin']}"
+        )
+        # Use a different seed offset so stopover dates don't collide with direct dates
+        pairs = date_combinations(seed=args.seed + (hash(route_label) % 1000))[:STOPOVER_COMBOS_PER_ROUTE]
+        print(f"\n[{route_label}] {len(pairs)} date combos · stop {route['stop_days']}d", file=sys.stderr)
+        for outbound, inbound in pairs:
+            print(f"  → {outbound} / {inbound}", file=sys.stderr)
+            r = search_stopover(route, outbound, inbound)
+            if r:
+                stopover_results.append(r)
+                airlines_summary = " + ".join(", ".join(leg["airlines"]) for leg in r["legs"])
+                print(
+                    f"    ✓ €{r['total_price_eur']} (sum) | {airlines_summary}",
+                    file=sys.stderr,
+                )
+            time.sleep(0.8)
+
     payload = {
         "fetched_at": int(time.time()),
         "fetched_at_iso": date.today().isoformat(),
@@ -183,7 +335,9 @@ def main():
         "destination": DESTINATION,
         "currency": CURRENCY,
         "results": results,
+        "stopover_results": stopover_results,
         "count": len(results),
+        "stopover_count": len(stopover_results),
     }
 
     output = json.dumps(payload, indent=2, ensure_ascii=False)

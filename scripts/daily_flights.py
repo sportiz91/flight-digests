@@ -63,7 +63,7 @@ def previous_min_by_origin(history: dict) -> dict:
 
 
 # ─── Groq analysis ────────────────────────────────────────────────────────────
-def ai_analysis(results: list, prev_min: dict) -> str:
+def ai_analysis(results: list, prev_min: dict, stopover_results: list | None = None) -> str:
     if not GROQ_API_KEY:
         return ""
 
@@ -87,16 +87,28 @@ def ai_analysis(results: list, prev_min: dict) -> str:
                 f"({r['trip_days']}d) | {airlines} | {r['stops']} escalas"
             )
 
+    stopover_block = ""
+    if stopover_results:
+        stopover_block = "\n\nStopover deals (tickets separados, suma de patas):"
+        for r in stopover_results[:6]:
+            airlines_summary = " + ".join(", ".join(leg["airlines"]) for leg in r["legs"])
+            stopover_block += (
+                f"\n  - €{r['total_price_eur']} | {r['origin']}↔EZE vía {r['stopover_city']} "
+                f"({r['stop_days']}d en {'ida' if r['kind'] == 'stopover-out' else 'vuelta'}) "
+                f"| {r['trip_days']}d | {airlines_summary}"
+            )
+
     prompt = f"""Sos un analista de vuelos que escribe en español argentino (voseo, rioplatense, directo).
-Analizá estas búsquedas de vuelos de hoy desde Barcelona/Madrid/Lisboa hacia Buenos Aires (EZE).
+Analizá estas búsquedas de hoy desde Barcelona/Madrid/Lisboa hacia Buenos Aires (EZE).
+El usuario siempre viaja entre 30 y 60 días, así que solo le interesan ofertas de esa duración.
 
-Datos:
-{"".join(summary_lines)}
+Vuelos directos:
+{"".join(summary_lines)}{stopover_block}
 
-Decime, en máximo 200 palabras:
+Decime, en máximo 220 palabras:
 1. Cuál es la MEJOR oferta de hoy y por qué (precio + ruta + fecha)
-2. ¿Conviene comprar ya o esperar? Justificá con datos
-3. ¿Hay algún patrón interesante? (ej: Madrid sale mucho más barato, ciertas fechas son ventana de oro, etc.)
+2. ¿Algún stopover vale la pena vs. el directo? Si sí, cuál y cuánto se ahorra
+3. ¿Conviene comprar ya o esperar? Justificá con datos
 4. Una recomendación accionable concreta
 
 Sé directo y opinado. Nada de "depende" o "podría". Cero hedging."""
@@ -213,30 +225,76 @@ def render_offer(r: dict, *, is_winner: bool = False) -> str:
     )
 
 
+def render_stopover(r: dict, *, savings: int | None) -> str:
+    """Render one stopover deal as a multi-line block."""
+    via = r["stopover_city"]
+    direction_label = "ida" if r["kind"] == "stopover-out" else "vuelta"
+    legs_summary = []
+    for leg in r["legs"]:
+        airlines = ", ".join(leg["airlines"])
+        legs_summary.append(f"{leg['from']}→{leg['to']} {leg['date']} ({airlines}, €{leg['price_eur']})")
+    legs_html = html_escape(" · ".join(legs_summary))
+
+    url = r.get("search_url", "")
+    price_label = f"€{r['total_price_eur']}"
+    if savings is not None and savings > 0:
+        price_label = f"💰 €{r['total_price_eur']} (−€{savings} vs directo)"
+    elif savings is not None and savings < 0:
+        price_label = f"€{r['total_price_eur']} (+€{-savings} vs directo)"
+
+    if url:
+        price_html = f'<a href="{url}"><b>{price_label}</b></a>'
+    else:
+        price_html = f"<b>{price_label}</b>"
+
+    return (
+        f"  • {price_html} · {r['origin']}↔EZE vía <b>{via}</b> "
+        f"({r['stop_days']}d en {direction_label}, {r['trip_days']}d total)\n"
+        f"      <i>{legs_html}</i>"
+    )
+
+
 def build_message(payload: dict, prev_min: dict, analysis: str = "") -> str:
     results = payload["results"]
-    if not results:
+    stopover_results = payload.get("stopover_results", [])
+
+    if not results and not stopover_results:
         return "<b>✈️ Flight Digests</b>\n\nNo se pudo obtener data hoy. Revisá el log del workflow."
 
-    # Find the absolute winner across all origins
-    winner = min(results, key=lambda x: x["price_eur"])
-    winner_id = (winner["origin"], winner["outbound_date"], winner["return_date"])
+    # Find the absolute winner across DIRECT results (the canonical baseline)
+    winner = min(results, key=lambda x: x["price_eur"]) if results else None
+    winner_id = (
+        (winner["origin"], winner["outbound_date"], winner["return_date"]) if winner else None
+    )
+
+    # Cheapest direct price per origin (used to compute stopover savings)
+    direct_min_by_origin: dict[str, int] = {}
+    for r in results:
+        cur = direct_min_by_origin.get(r["origin"])
+        if cur is None or r["price_eur"] < cur:
+            direct_min_by_origin[r["origin"]] = r["price_eur"]
 
     lines = [f"<b>✈️ Flight Digests — {payload['fetched_at_iso']}</b>"]
-    lines.append(f"<i>BCN/MAD/LIS → EZE · {payload['count']} búsquedas</i>")
-
-    # Headline with the winner — clickable
-    winner_airlines = html_escape(", ".join(winner["airlines"]))
-    winner_url = winner.get("search_url", "")
-    winner_link = (
-        f'<a href="{winner_url}">€{winner["price_eur"]}</a>' if winner_url else f'€{winner["price_eur"]}'
-    )
     lines.append(
-        f'\n🏆 <b>Mejor del día:</b> {winner_link} desde {winner["origin"]} '
-        f'({winner_airlines}, {winner["outbound_date"]} → {winner["return_date"]})'
+        f"<i>BCN/MAD/LIS → EZE · {payload['count']} directos · "
+        f"{payload.get('stopover_count', 0)} con stopover</i>"
     )
 
-    by_origin = {}
+    if winner:
+        winner_airlines = html_escape(", ".join(winner["airlines"]))
+        winner_url = winner.get("search_url", "")
+        winner_link = (
+            f'<a href="{winner_url}">€{winner["price_eur"]}</a>'
+            if winner_url
+            else f'€{winner["price_eur"]}'
+        )
+        lines.append(
+            f'\n🏆 <b>Mejor directo del día:</b> {winner_link} desde {winner["origin"]} '
+            f'({winner_airlines}, {winner["outbound_date"]} → {winner["return_date"]})'
+        )
+
+    # ── Direct round-trips by origin ───────────────────────────────────────
+    by_origin: dict[str, list] = {}
     for r in results:
         by_origin.setdefault(r["origin"], []).append(r)
 
@@ -253,6 +311,24 @@ def build_message(payload: dict, prev_min: dict, analysis: str = "") -> str:
         for r in items[:3]:
             is_winner = (r["origin"], r["outbound_date"], r["return_date"]) == winner_id
             lines.append(render_offer(r, is_winner=is_winner))
+
+    # ── Stopover deals ────────────────────────────────────────────────────
+    if stopover_results:
+        # Sort by savings (best deals first), then by absolute price
+        annotated = []
+        for r in stopover_results:
+            ref = direct_min_by_origin.get(r["origin"])
+            savings = (ref - r["total_price_eur"]) if ref else None
+            annotated.append((r, savings))
+        annotated.sort(key=lambda x: (-(x[1] or -999999), x[0]["total_price_eur"]))
+
+        lines.append("\n\n<b>🌐 Con stopover (tickets separados)</b>")
+        lines.append(
+            "<i>Suma de patas one-way comprando cada una por su lado. "
+            "El link abre la versión multi-city en Google Flights por si te ofrece un ticket único más barato.</i>"
+        )
+        for r, savings in annotated[:6]:
+            lines.append(render_stopover(r, savings=savings))
 
     if analysis:
         lines.append(f"\n\n<b>🤖 Análisis</b>\n\n{html_escape(analysis)}")
@@ -278,7 +354,7 @@ def main():
     print(f"[ok] previous min by origin: {prev_min}")
 
     print("[..] running AI analysis")
-    analysis = ai_analysis(payload["results"], prev_min)
+    analysis = ai_analysis(payload["results"], prev_min, payload.get("stopover_results"))
 
     print("[..] building message")
     message = build_message(payload, prev_min, analysis)
