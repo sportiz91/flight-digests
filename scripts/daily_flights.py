@@ -184,13 +184,57 @@ def trend_arrow(now: int, prev: int | None) -> str:
     return " ⚪ ="
 
 
+def fmt_duration(minutes: int) -> str:
+    """Format minutes as Xh YYm (e.g. 16h 35m)."""
+    if not minutes:
+        return ""
+    h, m = divmod(minutes, 60)
+    return f"{h}h {m:02d}m"
+
+
+def html_escape(s: str) -> str:
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def render_offer(r: dict, *, is_winner: bool = False) -> str:
+    airlines = html_escape(", ".join(r["airlines"]))
+    duration = fmt_duration(r.get("total_duration_min", 0))
+    url = r.get("search_url", "")
+    price_label = f"€{r['price_eur']}"
+    if is_winner:
+        price_label = f"🏆 {price_label}"
+    if url:
+        price_html = f'<a href="{url}"><b>{price_label}</b></a>'
+    else:
+        price_html = f"<b>{price_label}</b>"
+    return (
+        f"  • {price_html} · {r['outbound_date']} → {r['return_date']} "
+        f"({r['trip_days']}d · {duration}) · {airlines} · {r['stops']} esc"
+    )
+
+
 def build_message(payload: dict, prev_min: dict, analysis: str = "") -> str:
     results = payload["results"]
     if not results:
         return "<b>✈️ Flight Digests</b>\n\nNo se pudo obtener data hoy. Revisá el log del workflow."
 
+    # Find the absolute winner across all origins
+    winner = min(results, key=lambda x: x["price_eur"])
+    winner_id = (winner["origin"], winner["outbound_date"], winner["return_date"])
+
     lines = [f"<b>✈️ Flight Digests — {payload['fetched_at_iso']}</b>"]
-    lines.append(f"<i>BCN/MAD/LIS → EZE · {payload['count']} búsquedas</i>\n")
+    lines.append(f"<i>BCN/MAD/LIS → EZE · {payload['count']} búsquedas</i>")
+
+    # Headline with the winner — clickable
+    winner_airlines = html_escape(", ".join(winner["airlines"]))
+    winner_url = winner.get("search_url", "")
+    winner_link = (
+        f'<a href="{winner_url}">€{winner["price_eur"]}</a>' if winner_url else f'€{winner["price_eur"]}'
+    )
+    lines.append(
+        f'\n🏆 <b>Mejor del día:</b> {winner_link} desde {winner["origin"]} '
+        f'({winner_airlines}, {winner["outbound_date"]} → {winner["return_date"]})'
+    )
 
     by_origin = {}
     for r in results:
@@ -207,16 +251,13 @@ def build_message(payload: dict, prev_min: dict, analysis: str = "") -> str:
 
         lines.append(f"\n<b>{flag} {origin} → EZE</b>{arrow}")
         for r in items[:3]:
-            airlines = ", ".join(r["airlines"])
-            lines.append(
-                f"  • <b>€{r['price_eur']}</b> · {r['outbound_date']} → {r['return_date']} "
-                f"({r['trip_days']}d) · {airlines} · {r['stops']} esc"
-            )
+            is_winner = (r["origin"], r["outbound_date"], r["return_date"]) == winner_id
+            lines.append(render_offer(r, is_winner=is_winner))
 
     if analysis:
-        lines.append(f"\n\n<b>🤖 Análisis</b>\n\n{analysis}")
+        lines.append(f"\n\n<b>🤖 Análisis</b>\n\n{html_escape(analysis)}")
 
-    lines.append("\n\n<i>fuente: Google Flights vía fast-flights · 1 adulto · economy</i>")
+    lines.append("\n\n<i>tap any price to open Google Flights · 1 adulto · economy</i>")
     return "\n".join(lines)
 
 

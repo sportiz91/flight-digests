@@ -138,6 +138,8 @@ def search_one(origin: str, outbound: str, inbound: str) -> dict | None:
         "total_duration_min": total_duration_min,
         "type": cheapest.type,
         "total_offers": len(result),
+        # Pre-filled Google Flights URL — clicking it lands on the same search
+        "search_url": q.url(),
     }
 
 
