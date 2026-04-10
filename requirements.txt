@@ -1,0 +1,13 @@
+# Pinned for reproducibility and supply-chain safety.
+# See README "Security" section for the full audit summary.
+#
+# NOTE: We pin fast-flights==3.0rc0 (not the stable 2.2) because Google Flights
+# changed its HTML structure in early 2026 and the v2.2 CSS-selector parser is
+# no longer functional. v3.0rc0 parses Google's embedded JS data blob instead,
+# which is structurally more robust. The split-jobs workflow architecture
+# isolates this dependency from all secrets.
+fast-flights==3.0rc0
+primp==1.2.2
+protobuf==7.34.1
+selectolax==0.4.7
+rjsonc==0.1.2

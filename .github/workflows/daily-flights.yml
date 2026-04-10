@@ -1,0 +1,78 @@
+name: Daily Flight Digest
+
+on:
+  schedule:
+    # 06:13 and 18:13 UTC every day (offset to avoid GitHub's :00 congestion)
+    - cron: '13 6,18 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write  # needed by the notify job to commit price_history.json back
+
+jobs:
+  # ── Job 1: scrape Google Flights ─────────────────────────────────────────────
+  # Defense-in-depth: this job has NO secrets in its environment. If a future
+  # supply-chain compromise of fast-flights tries to read env vars, there is
+  # nothing of value to steal — neither the Telegram token nor the Groq key
+  # exist in this job's process.
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install pinned dependencies
+        run: pip install --no-deps -r requirements.txt && pip install -r requirements.txt
+
+      - name: Run flight scan
+        run: python scripts/search_flights.py --out results.json
+
+      - name: Upload results artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: flight-results
+          path: results.json
+          retention-days: 7
+
+  # ── Job 2: notify ────────────────────────────────────────────────────────────
+  # This job HAS the secrets but does NOT execute fast-flights. It only loads
+  # a JSON file produced by the previous job, calls Groq + Telegram, and
+  # commits the updated price history.
+  notify:
+    needs: scrape
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Download results artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: flight-results
+
+      - name: Run digest (Telegram + Groq)
+        env:
+          FLIGHT_TELEGRAM_BOT_TOKEN: ${{ secrets.FLIGHT_TELEGRAM_BOT_TOKEN }}
+          FLIGHT_TELEGRAM_CHAT_ID: ${{ secrets.FLIGHT_TELEGRAM_CHAT_ID }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+        run: python scripts/daily_flights.py --results results.json --history price_history.json
+
+      - name: Commit updated price history
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add price_history.json
+          if git diff --staged --quiet; then
+            echo "no history changes"
+          else
+            git commit -m "chore: update price history $(date -u +%Y-%m-%d)"
+            git push
+          fi
