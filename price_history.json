@@ -1,14 +1,6 @@
 {
   "runs": [
     {
-      "date": "2026-06-08",
-      "min_by_origin": {
-        "BCN": 965,
-        "MAD": 1113,
-        "LIS": 896
-      }
-    },
-    {
       "date": "2026-06-09",
       "min_by_origin": {
         "BCN": 932,
@@ -207,6 +199,10 @@
       "min_by_origin": {
         "LIS": 1474
       }
+    },
+    {
+      "date": "2026-06-23",
+      "min_by_origin": {}
     }
   ]
 }
